@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, font  # <--- Added font import
+from tkinter import ttk, messagebox, font
 import subprocess
 import os
 import threading
@@ -46,8 +46,6 @@ class ADBFileManager:
         self.connected_device = None
 
         # --- LINUX FONT FIX ---
-        # We use the font.Font object explicitly to force Anti-Aliasing
-        # We use "Liberation Sans" or "DejaVu Sans" which are standard on Ubuntu
         base_family = "Liberation Sans" 
         
         self.fonts = {
@@ -98,7 +96,6 @@ class ADBFileManager:
                                                                        fill=self.colors['accent'], 
                                                                        outline='')
         
-        # Removed Unicode arrow
         btn_reconnect = self._create_button(top_frame, "[R] Reconnect", 
                                            self._check_connection,
                                            style='normal')
@@ -153,7 +150,6 @@ class ADBFileManager:
         btn_frame = tk.Frame(frame, bg=self.colors['bg_light'])
         btn_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
         
-        # REMOVED EMOJIS HERE
         nav_buttons = [
             ("Home", lambda: self.go_home_local() if pane_type == "local" else self.go_home_android()),
             ("Up", lambda: self.go_up_local() if pane_type == "local" else self.go_up_android()),
@@ -212,14 +208,14 @@ class ADBFileManager:
                        foreground=self.colors['fg'],
                        fieldbackground=self.colors['bg_dark'],
                        borderwidth=0,
-                       font=self.fonts['default'], # Uses the object now
+                       font=self.fonts['default'], 
                        rowheight=28)
         
         style.configure("Treeview.Heading",
                        background=self.colors['bg'],
                        foreground=self.colors['fg'],
                        borderwidth=1,
-                       font=self.fonts['bold'], # Uses the object now
+                       font=self.fonts['bold'], 
                        relief='flat')
         
         style.map("Treeview",
@@ -229,7 +225,6 @@ class ADBFileManager:
         style.map("Treeview.Heading",
                  background=[('active', self.colors['bg_light'])])
         
-        # REMOVED EMOJIS HERE
         tree.heading('Name', text='Name')
         tree.heading('Size', text='Size')
         tree.heading('Type', text='Type')
@@ -268,7 +263,7 @@ class ADBFileManager:
             padx, pady = 12, 6
         
         btn = tk.Button(parent, text=text, command=command,
-                       font=font_obj, # Uses the object now
+                       font=font_obj, 
                        bg=bg, fg=fg,
                        activebackground=active_bg,
                        activeforeground=fg,
@@ -301,7 +296,6 @@ class ADBFileManager:
         btn_container = tk.Frame(frame, bg=self.colors['bg_light'])
         btn_container.pack(pady=15)
         
-        # REMOVED EMOJIS HERE
         btn_pull = self._create_button(btn_container, 
                                        "< Pull to Local (Shift+Left)",
                                        self.pull_file,
@@ -327,7 +321,7 @@ class ADBFileManager:
                             bg=self.colors['bg_light'])
         tip_label.pack(pady=(0, 10))
 
-    # --- UTILS & ADB (Same Logic, just standard font handling) ---
+    # --- UTILS & ADB ---
     def select_first_item(self, tree):
         children = tree.get_children()
         if children:
@@ -465,13 +459,14 @@ class ADBFileManager:
             items.sort(key=lambda x: (not os.path.isdir(os.path.join(self.local_cwd, x)), x.lower()))
             for item in items:
                 path = os.path.join(self.local_cwd, item)
-                # REMOVED EMOJIS
                 if os.path.isdir(path):
-                    self.tree_local.insert('', 'end', values=(f"[DIR] {item}", "", "Folder"))
+                    # REMOVED [DIR] prefix
+                    self.tree_local.insert('', 'end', values=(item, "", "Folder"))
                 else:
                     try: size = f"{os.path.getsize(path) / 1024:.1f} KB"
                     except: size = "?"
-                    self.tree_local.insert('', 'end', values=(f"      {item}", size, "File"))
+                    # REMOVED spaces indentation
+                    self.tree_local.insert('', 'end', values=(item, size, "File"))
             self.select_first_item(self.tree_local)
         except PermissionError:
             self.go_up_local()
@@ -488,8 +483,8 @@ class ADBFileManager:
         sel = self.tree_local.selection()
         if not sel: return
         item = self.tree_local.item(sel[0])
-        # CHANGED STRIP LOGIC
-        name = str(item['values'][0]).replace("[DIR] ", "").replace("      ", "")
+        # REMOVED replace/strip logic
+        name = str(item['values'][0])
         itype = item['values'][2]
         if itype == "Folder":
             self.local_cwd = os.path.join(self.local_cwd, name)
@@ -521,9 +516,8 @@ class ADBFileManager:
             self.tree_android.delete(item)
         items.sort(key=lambda x: (x[2] != "Folder", x[0].lower()))
         for name, size, ftype in items:
-            # REMOVED EMOJIS
-            icon = "[DIR]" if ftype == "Folder" else "     "
-            self.tree_android.insert('', 'end', values=(f"{icon} {name}", size, ftype))
+            # REMOVED [DIR] prefix and spacing
+            self.tree_android.insert('', 'end', values=(name, size, ftype))
         self.select_first_item(self.tree_android)
 
     def go_up_android(self):
@@ -542,8 +536,8 @@ class ADBFileManager:
         sel = self.tree_android.selection()
         if not sel: return
         item = self.tree_android.item(sel[0])
-        # CHANGED STRIP LOGIC
-        name = str(item['values'][0]).replace("[DIR] ", "").replace("      ", "").strip()
+        # REMOVED replace/strip logic
+        name = str(item['values'][0])
         itype = item['values'][2]
         if itype == "Folder":
             if self.android_cwd == "/": self.android_cwd += name + "/"
@@ -553,14 +547,16 @@ class ADBFileManager:
     def request_push_confirm(self, event=None):
         sel = self.tree_local.selection()
         if not sel: return
-        name = str(self.tree_local.item(sel[0])['values'][0]).replace("[DIR] ", "").replace("      ", "")
+        # REMOVED replace logic
+        name = str(self.tree_local.item(sel[0])['values'][0])
         if messagebox.askyesno("Confirm", f"Push '{name}' to Android?"):
             self.push_file()
 
     def request_pull_confirm(self, event=None):
         sel = self.tree_android.selection()
         if not sel: return
-        name = str(self.tree_android.item(sel[0])['values'][0]).replace("[DIR] ", "").replace("      ", "").strip()
+        # REMOVED replace logic
+        name = str(self.tree_android.item(sel[0])['values'][0])
         if messagebox.askyesno("Confirm", f"Pull '{name}' from Android?"):
             self.pull_file()
 
@@ -568,7 +564,8 @@ class ADBFileManager:
         sel = self.tree_android.selection()
         if not sel: return
         item = self.tree_android.item(sel[0])
-        name = str(item['values'][0]).replace("[DIR] ", "").replace("      ", "").strip()
+        # REMOVED replace logic
+        name = str(item['values'][0])
         android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
         def task():
             self.root.after(0, lambda: self.set_progress(0))
@@ -587,7 +584,8 @@ class ADBFileManager:
         sel = self.tree_local.selection()
         if not sel: return
         item = self.tree_local.item(sel[0])
-        name = str(item['values'][0]).replace("[DIR] ", "").replace("      ", "")
+        # REMOVED replace logic
+        name = str(item['values'][0])
         local_path = os.path.join(self.local_cwd, name)
         def task():
             self.root.after(0, lambda: self.set_progress(0))
