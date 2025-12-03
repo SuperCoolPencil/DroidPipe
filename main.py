@@ -4,9 +4,9 @@ import subprocess
 import os
 import threading
 import time
-
-# Configuration
-DEFAULT_ANDROID_PATH = "/sdcard/"
+import re
+import logging
+import argparse
 
 class ADBFileManager:
     def __init__(self, root):
@@ -138,36 +138,96 @@ class ADBFileManager:
             tree.see(first)
 
     def set_loading(self, is_loading):
-        """Toggle progress bar animation."""
+        """Toggle indeterminate progress bar animation (e.g., for ls)."""
         if is_loading:
+            self.progress_bar.config(mode='indeterminate')
             self.progress_bar.start(10) # Bounce every 10ms
         else:
             self.progress_bar.stop()
+            self.progress_bar.config(mode='indeterminate')
+            self.progress_bar['value'] = 0
+
+    def set_progress(self, value):
+        """Set determinate progress value (0-100)."""
+        self.progress_bar.config(mode='determinate')
+        self.progress_bar['value'] = value
 
     # --- ADB Logic ---
     def run_adb_cmd(self, cmd_list):
-        """Runs an ADB command and returns (stdout, stderr)."""
+        """Runs a simple ADB command and returns (stdout, stderr)."""
+        logging.debug(f"Running ADB command: {' '.join(cmd_list)}")
         try:
             full_cmd = ['adb'] + cmd_list
-            # Using specific encoding to handle potential non-ascii chars
             result = subprocess.run(full_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
             return result.stdout.strip(), result.stderr.strip()
         except FileNotFoundError:
+            logging.error("ADB executable not found in PATH.")
             return None, "ADB executable not found in PATH."
+
+    def run_adb_transfer(self, cmd_list, progress_callback):
+        """Runs ADB command with -p and parses progress byte-by-byte for real-time updates."""
+        logging.debug(f"Running ADB transfer command: {' '.join(cmd_list)}")
+        try:
+            full_cmd = ['adb'] + cmd_list
+            
+            # Use bufsize=0 (unbuffered) and binary mode to read bytes immediately.
+            # This is critical because adb updates the same line using \r, 
+            # and line-buffered text mode will wait for \n which never comes until the end.
+            process = subprocess.Popen(
+                full_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0, 
+            )
+            
+            output_buffer = b""
+            while True:
+                # Read 1 byte at a time to catch every update immediately
+                char = process.stdout.read(1)
+                if not char:
+                    break
+                
+                output_buffer += char
+                
+                # Performance optimization: Only attempt to parse if we hit a % or ]
+                # This prevents decoding the string on every single byte.
+                if char in [b'%', b']']:
+                    try:
+                        # Decode only the recent part of the buffer
+                        current_str = output_buffer[-100:].decode('utf-8', errors='ignore')
+                        
+                        # Regex to find percentage like [ 15%] or 15%
+                        matches = list(re.finditer(r'(\d+)%', current_str))
+                        if matches:
+                            last_match = matches[-1]
+                            p = int(last_match.group(1))
+                            if progress_callback:
+                                self.root.after(0, lambda val=p: progress_callback(val))
+                    except Exception:
+                        pass
+            
+            process.wait()
+            return output_buffer.decode('utf-8', errors='replace'), process.returncode
+        except FileNotFoundError:
+            logging.error("ADB executable not found in PATH for transfer command.")
+            return None, -1
 
     def _check_connection(self):
         def check():
+            logging.info("Checking ADB connection...")
             self.root.after(0, lambda: self.set_loading(True))
             out, err = self.run_adb_cmd(['devices'])
             
             self.root.after(0, lambda: self.set_loading(False))
 
             if err and "not found" in err:
+                logging.error("ADB executable not found.")
                 self.update_status("Error: ADB not found.", "red")
                 return
 
             if not out:
                 self.connected_device = None
+                logging.error("ADB Error: No output from \'adb devices\'.")
                 self.update_status("ADB Error: No output.", "red")
                 return
 
@@ -176,11 +236,13 @@ class ADBFileManager:
             
             if devices:
                 self.connected_device = devices[0].split()[0]
+                logging.info(f"Connected to device: {self.connected_device}")
                 self.update_status(f"Connected: {self.connected_device}", "green")
                 self.root.after(0, self.refresh_android)
                 self.root.after(0, self.refresh_local)
             else:
                 self.connected_device = None
+                logging.warning("No ADB devices found. Please connect a device and enable USB debugging.")
                 self.update_status("No device found. Connect via USB & enable Debugging.", "red")
                 # Clear android tree
                 for item in self.tree_android.get_children():
@@ -193,6 +255,7 @@ class ADBFileManager:
 
     # --- Local File System Logic ---
     def refresh_local(self):
+        logging.debug(f"Refreshing local directory: {self.local_cwd}")
         self.lbl_local_path.config(text=self.local_cwd)
         # Clear tree
         for item in self.tree_local.get_children():
@@ -214,26 +277,32 @@ class ADBFileManager:
             self.select_first_item(self.tree_local)
             
         except PermissionError:
+            logging.error(f"Permission denied for local directory: {self.local_cwd}")
             messagebox.showerror("Error", "Permission Denied")
             self.go_up_local()
 
     def go_up_local(self):
+        logging.debug(f"Going up in local directory from: {self.local_cwd}")
         self.local_cwd = os.path.dirname(self.local_cwd)
         self.refresh_local()
 
     def go_home_local(self):
+        logging.debug("Going to local home directory.")
         self.local_cwd = os.path.expanduser("~")
         self.refresh_local()
 
     def on_local_interact(self, event):
         sel = self.tree_local.selection()
-        if not sel: return
+        if not sel: 
+            logging.debug("No item selected for local interaction.")
+            return
 
         item_id = sel[0]
         item = self.tree_local.item(item_id)
         name = str(item['values'][0])
         itype = item['values'][2]
 
+        logging.debug(f"Local item interacted: {name} (Type: {itype})")
         if itype == "Dir":
             self.local_cwd = os.path.join(self.local_cwd, name)
             self.refresh_local()
@@ -241,9 +310,11 @@ class ADBFileManager:
     # --- Android File System Logic ---
     def refresh_android(self):
         if not self.connected_device:
+            logging.debug("Attempted to refresh Android, but no device is connected.")
             return
 
         def fetch():
+            logging.debug(f"Refreshing Android directory: {self.android_cwd}")
             self.root.after(0, lambda: self.set_loading(True))
             cmd = ['shell', f'ls -p "{self.android_cwd}"']
             out, err = self.run_adb_cmd(cmd)
@@ -280,6 +351,7 @@ class ADBFileManager:
         self.select_first_item(self.tree_android)
 
     def go_up_android(self):
+        logging.debug(f"Going up in Android directory from: {self.android_cwd}")
         if self.android_cwd == "/":
             return
         
@@ -293,18 +365,22 @@ class ADBFileManager:
         self.refresh_android()
 
     def go_home_android(self):
+        logging.debug("Going to Android home directory.")
         self.android_cwd = "/storage/emulated/0/"
         self.refresh_android()
 
     def on_android_interact(self, event):
         sel = self.tree_android.selection()
-        if not sel: return
+        if not sel: 
+            logging.debug("No item selected for Android interaction.")
+            return
         
         item_id = sel[0]
         item = self.tree_android.item(item_id)
         name = str(item['values'][0])
         itype = item['values'][2]
 
+        logging.debug(f"Android item interacted: {name} (Type: {itype})")
         if itype == "Dir":
             if self.android_cwd == "/":
                 self.android_cwd += name + "/"
@@ -319,6 +395,7 @@ class ADBFileManager:
         if not sel: return
         
         name = str(self.tree_local.item(sel[0])['values'][0])
+        logging.debug(f"Push confirmation requested for: {name}")
         if messagebox.askyesno("Confirm Push", f"Push '{name}' to Android?"):
             self.push_file()
 
@@ -328,6 +405,7 @@ class ADBFileManager:
         if not sel: return
 
         name = str(self.tree_android.item(sel[0])['values'][0])
+        logging.debug(f"Pull confirmation requested for: {name}")
         if messagebox.askyesno("Confirm Pull", f"Pull '{name}' to Computer?"):
             self.pull_file()
 
@@ -335,31 +413,40 @@ class ADBFileManager:
         """ Local -> Android """
         sel = self.tree_local.selection()
         if not sel:
+            logging.warning("Push initiated without a selected file.")
             messagebox.showinfo("Select File", "Please select a file on the Local side to push.")
             return
         
         item = self.tree_local.item(sel[0])
         name = str(item['values'][0])
         local_path = os.path.join(self.local_cwd, name)
+        logging.info(f"Initiating push for local file: {local_path} to Android directory: {self.android_cwd}")
         
         def task():
-            self.root.after(0, lambda: self.set_loading(True))
-            start_t = time.time()
-            self.update_status(f"Pushing {name}...", "blue")
+            # Reset bar to 0 and determinate mode
+            self.root.after(0, lambda: self.set_progress(0))
             
-            # Using -p sometimes helps with large files, but run() captures after.
-            # We rely on the UI progress bar for feedback here.
-            out, err = self.run_adb_cmd(['push', local_path, self.android_cwd])
+            start_t = time.time()
+            self.update_status(f"Pushing {name}...", "orange")
+            
+            def update_ui_prog(val):
+                self.set_progress(val)
+
+            # Use -p for progress
+            out, ret_code = self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], update_ui_prog)
             
             duration = time.time() - start_t
+            # Reset to empty state
             self.root.after(0, lambda: self.set_loading(False))
 
-            if "error" in out.lower() or (err and "error" in err.lower()):
-                 self.root.after(0, lambda: messagebox.showerror("Push Error", f"{out}\n{err}"))
-                 self.root.after(0, lambda: self.update_status("Push Failed", "red"))
+            if ret_code != 0:
+                logging.error(f"Push failed for {name}: {out}")
+                self.root.after(0, lambda: messagebox.showerror("Push Error", f"{out}"))
+                self.root.after(0, lambda: self.update_status("Push Failed", "red"))
             else:
-                 self.root.after(0, self.refresh_android)
-                 self.root.after(0, lambda: self.update_status(f"Push Complete ({duration:.2f}s)", "green"))
+                logging.info(f"Push of {name} completed in {duration:.2f}s")
+                self.root.after(0, self.refresh_android)
+                self.root.after(0, lambda: self.update_status(f"Push Complete ({duration:.2f}s)", "green"))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -367,37 +454,58 @@ class ADBFileManager:
         """ Android -> Local """
         sel = self.tree_android.selection()
         if not sel:
+            logging.warning("Pull initiated without a selected file.")
             messagebox.showinfo("Select File", "Please select a file on the Android side to pull.")
             return
 
         item = self.tree_android.item(sel[0])
         name = str(item['values'][0])
         android_path = os.path.join(self.android_cwd, name)
-        if self.android_cwd.endswith('/'):
+        logging.info(f"Initiating pull for Android file: {android_path} to local directory: {self.local_cwd}")
+        if self.android_cwd.endswith('\\/'):
             android_path = self.android_cwd + name
         else:
             android_path = self.android_cwd + '/' + name
 
         def task():
-            self.root.after(0, lambda: self.set_loading(True))
-            start_t = time.time()
-            self.update_status(f"Pulling {name}...", "blue")
+            # Reset bar to 0 and determinate mode
+            self.root.after(0, lambda: self.set_progress(0))
             
-            out, err = self.run_adb_cmd(['pull', android_path, self.local_cwd])
+            start_t = time.time()
+            self.update_status(f"Pulling {name}...", "orange")
+            
+            def update_ui_prog(val):
+                self.set_progress(val)
+
+            # Use -p for progress
+            out, ret_code = self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], update_ui_prog)
             
             duration = time.time() - start_t
             self.root.after(0, lambda: self.set_loading(False))
 
-            if "error" in out.lower() or (err and "error" in err.lower()):
-                 self.root.after(0, lambda: messagebox.showerror("Pull Error", f"{out}\n{err}"))
-                 self.root.after(0, lambda: self.update_status("Pull Failed", "red"))
+            if ret_code != 0:
+                logging.error(f"Pull failed for {name}: {out}")
+                self.root.after(0, lambda: messagebox.showerror("Pull Error", f"{out}"))
+                self.root.after(0, lambda: self.update_status("Pull Failed", "red"))
             else:
-                 self.root.after(0, self.refresh_local)
-                 self.root.after(0, lambda: self.update_status(f"Pull Complete ({duration:.2f}s)", "green"))
+                logging.info(f"Pull of {name} completed in {duration:.2f}s")
+                self.root.after(0, self.refresh_local)
+                self.root.after(0, lambda: self.update_status(f"Pull Complete ({duration:.2f}s)", "green"))
 
         threading.Thread(target=task, daemon=True).start()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DroidPipe - ADB File Manager")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.debug("Debug logging enabled.")
+    else:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.info("Info logging enabled. Use -d or --debug for debug messages.")
+
     root = tk.Tk()
     app = ADBFileManager(root)
     root.mainloop()
