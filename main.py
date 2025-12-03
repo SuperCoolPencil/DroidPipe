@@ -28,13 +28,19 @@ class ADBFileManager:
         self._check_connection()
 
     def _init_ui(self):
-        # --- Top Bar (Status & Refresh) ---
+        # --- Top Bar (Status, Progress, Refresh) ---
         top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(fill=tk.X)
         
-        self.lbl_status = ttk.Label(top_frame, text="Checking ADB connection...", foreground="blue")
+        # Status Label
+        self.lbl_status = ttk.Label(top_frame, text="Checking ADB connection...", foreground="blue", width=40)
         self.lbl_status.pack(side=tk.LEFT)
         
+        # Progress Bar (Hidden by default or stopped)
+        self.progress_bar = ttk.Progressbar(top_frame, mode='indeterminate', length=200)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        
+        # Refresh Button
         btn_refresh = ttk.Button(top_frame, text="↻ Reconnect ADB", command=self._check_connection)
         btn_refresh.pack(side=tk.RIGHT)
 
@@ -131,6 +137,13 @@ class ADBFileManager:
             tree.focus(first)
             tree.see(first)
 
+    def set_loading(self, is_loading):
+        """Toggle progress bar animation."""
+        if is_loading:
+            self.progress_bar.start(10) # Bounce every 10ms
+        else:
+            self.progress_bar.stop()
+
     # --- ADB Logic ---
     def run_adb_cmd(self, cmd_list):
         """Runs an ADB command and returns (stdout, stderr)."""
@@ -144,7 +157,11 @@ class ADBFileManager:
 
     def _check_connection(self):
         def check():
+            self.root.after(0, lambda: self.set_loading(True))
             out, err = self.run_adb_cmd(['devices'])
+            
+            self.root.after(0, lambda: self.set_loading(False))
+
             if err and "not found" in err:
                 self.update_status("Error: ADB not found.", "red")
                 return
@@ -227,8 +244,10 @@ class ADBFileManager:
             return
 
         def fetch():
+            self.root.after(0, lambda: self.set_loading(True))
             cmd = ['shell', f'ls -p "{self.android_cwd}"']
             out, err = self.run_adb_cmd(cmd)
+            self.root.after(0, lambda: self.set_loading(False))
             
             items_data = []
             if out:
@@ -324,13 +343,20 @@ class ADBFileManager:
         local_path = os.path.join(self.local_cwd, name)
         
         def task():
+            self.root.after(0, lambda: self.set_loading(True))
             start_t = time.time()
-            self.update_status(f"Pushing {name}...", "orange")
-            out, err = self.run_adb_cmd(['push', local_path, self.android_cwd])
-            duration = time.time() - start_t
+            self.update_status(f"Pushing {name}...", "blue")
             
+            # Using -p sometimes helps with large files, but run() captures after.
+            # We rely on the UI progress bar for feedback here.
+            out, err = self.run_adb_cmd(['push', local_path, self.android_cwd])
+            
+            duration = time.time() - start_t
+            self.root.after(0, lambda: self.set_loading(False))
+
             if "error" in out.lower() or (err and "error" in err.lower()):
                  self.root.after(0, lambda: messagebox.showerror("Push Error", f"{out}\n{err}"))
+                 self.root.after(0, lambda: self.update_status("Push Failed", "red"))
             else:
                  self.root.after(0, self.refresh_android)
                  self.root.after(0, lambda: self.update_status(f"Push Complete ({duration:.2f}s)", "green"))
@@ -353,13 +379,18 @@ class ADBFileManager:
             android_path = self.android_cwd + '/' + name
 
         def task():
+            self.root.after(0, lambda: self.set_loading(True))
             start_t = time.time()
-            self.update_status(f"Pulling {name}...", "orange")
+            self.update_status(f"Pulling {name}...", "blue")
+            
             out, err = self.run_adb_cmd(['pull', android_path, self.local_cwd])
+            
             duration = time.time() - start_t
+            self.root.after(0, lambda: self.set_loading(False))
 
             if "error" in out.lower() or (err and "error" in err.lower()):
                  self.root.after(0, lambda: messagebox.showerror("Pull Error", f"{out}\n{err}"))
+                 self.root.after(0, lambda: self.update_status("Pull Failed", "red"))
             else:
                  self.root.after(0, self.refresh_local)
                  self.root.after(0, lambda: self.update_status(f"Pull Complete ({duration:.2f}s)", "green"))
