@@ -6,6 +6,8 @@ import threading
 import time
 import re
 import logging
+import pty
+import select
 import argparse
 
 class ADBFileManager:
@@ -165,52 +167,83 @@ class ADBFileManager:
             return None, "ADB executable not found in PATH."
 
     def run_adb_transfer(self, cmd_list, progress_callback):
-        """Runs ADB command with -p and parses progress byte-by-byte for real-time updates."""
+        """Runs ADB command using a pseudo-terminal to force progress bar output."""
         logging.debug(f"Running ADB transfer command: {' '.join(cmd_list)}")
+        
+        # Create a pseudo-terminal (master = our script, slave = ADB's view)
+        master_fd, slave_fd = pty.openpty()
+        
         try:
             full_cmd = ['adb'] + cmd_list
             
-            # Use bufsize=0 (unbuffered) and binary mode to read bytes immediately.
-            # This is critical because adb updates the same line using \r, 
-            # and line-buffered text mode will wait for \n which never comes until the end.
             process = subprocess.Popen(
                 full_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0, 
+                stdout=slave_fd,
+                stderr=slave_fd, # Merge stderr to capture progress
+                close_fds=True   # Important for PTY
             )
             
+            # Close the slave handle in the parent; only the child (ADB) needs it.
+            # If we don't close it, os.read will hang at the end waiting for EOF.
+            os.close(slave_fd)
+            
             output_buffer = b""
+            
             while True:
-                # Read 1 byte at a time to catch every update immediately
-                char = process.stdout.read(1)
-                if not char:
-                    break
+                # Use select to wait for data with a timeout to prevent UI freezing
+                # if ADB hangs, though running in a thread mitigates this.
+                r, w, e = select.select([master_fd], [], [], 0.1)
                 
-                output_buffer += char
-                
-                # Performance optimization: Only attempt to parse if we hit a % or ]
-                # This prevents decoding the string on every single byte.
-                if char in [b'%', b']']:
+                if master_fd in r:
                     try:
-                        # Decode only the recent part of the buffer
-                        current_str = output_buffer[-100:].decode('utf-8', errors='ignore')
+                        # Read a chunk of data (up to 1024 bytes)
+                        chunk = os.read(master_fd, 1024)
+                        if not chunk:
+                            break # EOF
                         
-                        # Regex to find percentage like [ 15%] or 15%
-                        matches = list(re.finditer(r'(\d+)%', current_str))
-                        if matches:
-                            last_match = matches[-1]
-                            p = int(last_match.group(1))
-                            if progress_callback:
-                                self.root.after(0, lambda val=p: progress_callback(val))
-                    except Exception:
-                        pass
+                        # Append chunk and KEEP BUFFER SMALL (prevent memory leak)
+                        output_buffer += chunk
+                        output_buffer = output_buffer[-1024:] 
+                        
+                        # Parse the recent buffer for progress
+                        try:
+                            # ADB sends \r to overwrite lines. We look at the last bit of text.
+                            current_str = output_buffer.decode('utf-8', errors='ignore')
+                            
+                            # Regex to find percentage like [ 15%] or 15%
+                            # We search for the LAST occurrence in the chunk
+                            matches = list(re.finditer(r'(\d+)%', current_str))
+                            if matches:
+                                last_match = matches[-1]
+                                p = int(last_match.group(1))
+                                if progress_callback:
+                                    self.root.after(0, lambda val=p: progress_callback(val))
+                        except Exception:
+                            pass
+                            
+                    except OSError:
+                        break # Process likely ended
+                elif process.poll() is not None:
+                    # Process finished and no data left to read
+                    break
             
             process.wait()
-            return output_buffer.decode('utf-8', errors='replace'), process.returncode
+            # We don't return full output here because we truncated the buffer 
+            # to save memory, but we return the exit code.
+            return "Transfer finished", process.returncode
+
         except FileNotFoundError:
             logging.error("ADB executable not found in PATH for transfer command.")
+            if 'slave_fd' in locals(): os.close(slave_fd)
+            if 'master_fd' in locals(): os.close(master_fd)
             return None, -1
+        finally:
+            # Ensure master is closed
+            if 'master_fd' in locals():
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
 
     def _check_connection(self):
         def check():
