@@ -186,19 +186,13 @@ class ADBFileManager:
         tree_frame = tk.Frame(parent, bg=self.colors['bg_dark'])
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
-        vsb = tk.Scrollbar(tree_frame, orient='vertical')
-        hsb = tk.Scrollbar(tree_frame, orient='horizontal')
+        # --- REMOVED SCROLLBARS ---
         
         tree = ttk.Treeview(tree_frame, 
                            columns=('Name', 'Size', 'Type'),
                            show='headings',
                            selectmode='browse',
-                           height=15,
-                           yscrollcommand=vsb.set,
-                           xscrollcommand=hsb.set)
-        
-        vsb.config(command=tree.yview)
-        hsb.config(command=tree.xview)
+                           height=15)
         
         style = ttk.Style()
         style.theme_use('default')
@@ -233,9 +227,8 @@ class ADBFileManager:
         tree.column('Size', width=100, minwidth=80, anchor='e')
         tree.column('Type', width=90, minwidth=70, anchor='center')
         
+        # Grid tree to fill frame
         tree.grid(row=0, column=0, sticky='nsew')
-        vsb.grid(row=0, column=1, sticky='ns')
-        hsb.grid(row=1, column=0, sticky='ew')
         
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
@@ -460,12 +453,10 @@ class ADBFileManager:
             for item in items:
                 path = os.path.join(self.local_cwd, item)
                 if os.path.isdir(path):
-                    # REMOVED [DIR] prefix
                     self.tree_local.insert('', 'end', values=(item, "", "Folder"))
                 else:
                     try: size = f"{os.path.getsize(path) / 1024:.1f} KB"
                     except: size = "?"
-                    # REMOVED spaces indentation
                     self.tree_local.insert('', 'end', values=(item, size, "File"))
             self.select_first_item(self.tree_local)
         except PermissionError:
@@ -483,7 +474,6 @@ class ADBFileManager:
         sel = self.tree_local.selection()
         if not sel: return
         item = self.tree_local.item(sel[0])
-        # REMOVED replace/strip logic
         name = str(item['values'][0])
         itype = item['values'][2]
         if itype == "Folder":
@@ -516,7 +506,6 @@ class ADBFileManager:
             self.tree_android.delete(item)
         items.sort(key=lambda x: (x[2] != "Folder", x[0].lower()))
         for name, size, ftype in items:
-            # REMOVED [DIR] prefix and spacing
             self.tree_android.insert('', 'end', values=(name, size, ftype))
         self.select_first_item(self.tree_android)
 
@@ -536,7 +525,6 @@ class ADBFileManager:
         sel = self.tree_android.selection()
         if not sel: return
         item = self.tree_android.item(sel[0])
-        # REMOVED replace/strip logic
         name = str(item['values'][0])
         itype = item['values'][2]
         if itype == "Folder":
@@ -547,7 +535,6 @@ class ADBFileManager:
     def request_push_confirm(self, event=None):
         sel = self.tree_local.selection()
         if not sel: return
-        # REMOVED replace logic
         name = str(self.tree_local.item(sel[0])['values'][0])
         if messagebox.askyesno("Confirm", f"Push '{name}' to Android?"):
             self.push_file()
@@ -555,7 +542,6 @@ class ADBFileManager:
     def request_pull_confirm(self, event=None):
         sel = self.tree_android.selection()
         if not sel: return
-        # REMOVED replace logic
         name = str(self.tree_android.item(sel[0])['values'][0])
         if messagebox.askyesno("Confirm", f"Pull '{name}' from Android?"):
             self.pull_file()
@@ -564,7 +550,6 @@ class ADBFileManager:
         sel = self.tree_android.selection()
         if not sel: return
         item = self.tree_android.item(sel[0])
-        # REMOVED replace logic
         name = str(item['values'][0])
         android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
         def task():
@@ -584,7 +569,6 @@ class ADBFileManager:
         sel = self.tree_local.selection()
         if not sel: return
         item = self.tree_local.item(sel[0])
-        # REMOVED replace logic
         name = str(item['values'][0])
         local_path = os.path.join(self.local_cwd, name)
         def task():
