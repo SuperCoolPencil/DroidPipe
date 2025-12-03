@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, font
 import subprocess
 import os
+import shutil
 import threading
 import time
 import re
@@ -31,6 +32,7 @@ class ADBFileManager:
             'accent_hover': '#1e8ad6',
             'success': '#4ec9b0',
             'error': '#f48771',
+            'error_hover': '#d9534f',
             'warning': '#dcdcaa',
             'border': '#3e3e3e',
             'select': '#264f78',
@@ -44,6 +46,7 @@ class ADBFileManager:
         self.local_cwd = os.path.expanduser("~")
         self.android_cwd = "/storage/emulated/0/"
         self.connected_device = None
+        self.active_pane = "local" # Tracks which pane was last active for keyboard shortcuts
 
         # --- LINUX FONT FIX ---
         base_family = "Liberation Sans" 
@@ -91,10 +94,17 @@ class ADBFileManager:
         self.progress_canvas = tk.Canvas(progress_frame, width=250, height=20, 
                                         bg=self.colors['bg_dark'], 
                                         highlightthickness=0)
-        self.progress_canvas.pack()
+        self.progress_canvas.pack(side=tk.LEFT)
         self.progress_bar_rect = self.progress_canvas.create_rectangle(0, 0, 0, 20, 
                                                                        fill=self.colors['accent'], 
                                                                        outline='')
+        
+        self.lbl_percent = tk.Label(progress_frame, text="0%", 
+                                    font=self.fonts['small'],
+                                    fg=self.colors['fg'],
+                                    bg=self.colors['bg_dark'],
+                                    width=5)
+        self.lbl_percent.pack(side=tk.LEFT, padx=(5, 5))
         
         btn_reconnect = self._create_button(top_frame, "[R] Reconnect", 
                                            self._check_connection,
@@ -150,14 +160,18 @@ class ADBFileManager:
         btn_frame = tk.Frame(frame, bg=self.colors['bg_light'])
         btn_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
         
+        # --- NAV BUTTONS (Included Delete Here) ---
         nav_buttons = [
             ("Home", lambda: self.go_home_local() if pane_type == "local" else self.go_home_android()),
             ("Up", lambda: self.go_up_local() if pane_type == "local" else self.go_up_android()),
-            ("Refresh", lambda: self.refresh_local() if pane_type == "local" else self.refresh_android())
+            ("Refresh", lambda: self.refresh_local() if pane_type == "local" else self.refresh_android()),
+            ("Delete", lambda: self.delete_selection(target=pane_type))
         ]
         
         for text, cmd in nav_buttons:
-            btn = self._create_button(btn_frame, text, cmd, style='small')
+            # Use danger_small style for the delete button
+            style = 'danger_small' if text == "Delete" else 'small'
+            btn = self._create_button(btn_frame, text, cmd, style=style)
             btn.pack(side=tk.LEFT, padx=2)
         
         tree_frame = tk.Frame(frame, bg=self.colors['bg_light'])
@@ -172,6 +186,8 @@ class ADBFileManager:
             tree.bind("<Escape>", lambda e: self.go_up_local())
             tree.bind("<Right>", lambda e: self.tree_android.focus_set())
             tree.bind("<Shift-Right>", self.request_push_confirm)
+            tree.bind("<FocusIn>", lambda e: setattr(self, 'active_pane', 'local'))
+            tree.bind("<Delete>", lambda e: self.delete_selection(target='local')) 
         else:
             self.tree_android = tree
             tree.bind("<Double-1>", self.on_android_interact)
@@ -179,14 +195,14 @@ class ADBFileManager:
             tree.bind("<Escape>", lambda e: self.go_up_android())
             tree.bind("<Left>", lambda e: self.tree_local.focus_set())
             tree.bind("<Shift-Left>", self.request_pull_confirm)
+            tree.bind("<FocusIn>", lambda e: setattr(self, 'active_pane', 'android'))
+            tree.bind("<Delete>", lambda e: self.delete_selection(target='android'))
         
         return frame
 
     def _create_treeview(self, parent):
         tree_frame = tk.Frame(parent, bg=self.colors['bg_dark'])
         tree_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # --- REMOVED SCROLLBARS ---
         
         tree = ttk.Treeview(tree_frame, 
                            columns=('Name', 'Size', 'Type'),
@@ -227,7 +243,6 @@ class ADBFileManager:
         tree.column('Size', width=100, minwidth=80, anchor='e')
         tree.column('Type', width=90, minwidth=70, anchor='center')
         
-        # Grid tree to fill frame
         tree.grid(row=0, column=0, sticky='nsew')
         
         tree_frame.grid_rowconfigure(0, weight=1)
@@ -242,6 +257,19 @@ class ADBFileManager:
             active_bg = self.colors['accent_hover']
             font_obj = self.fonts['bold']
             padx, pady = 20, 10
+        elif style == 'danger':
+            bg = self.colors['error']
+            fg = 'white'
+            active_bg = self.colors['error_hover']
+            font_obj = self.fonts['bold']
+            padx, pady = 15, 10
+        elif style == 'danger_small':
+            # Subtle danger button for nav bar
+            bg = self.colors['bg']
+            fg = self.colors['error']
+            active_bg = self.colors['bg_light']
+            font_obj = self.fonts['default']
+            padx, pady = 10, 6
         elif style == 'small':
             bg = self.colors['bg']
             fg = self.colors['fg']
@@ -265,8 +293,13 @@ class ADBFileManager:
                        padx=padx, pady=pady,
                        cursor='hand2')
         
-        btn.bind('<Enter>', lambda e: btn.config(bg=active_bg))
-        btn.bind('<Leave>', lambda e: btn.config(bg=bg))
+        # Override hover for danger_small to keep text red
+        if style == 'danger_small':
+            btn.bind('<Enter>', lambda e: btn.config(bg=active_bg, fg=self.colors['error_hover']))
+            btn.bind('<Leave>', lambda e: btn.config(bg=bg, fg=self.colors['error']))
+        else:
+            btn.bind('<Enter>', lambda e: btn.config(bg=active_bg))
+            btn.bind('<Leave>', lambda e: btn.config(bg=bg))
         
         return btn
 
@@ -290,10 +323,12 @@ class ADBFileManager:
         btn_container.pack(pady=15)
         
         btn_pull = self._create_button(btn_container, 
-                                       "< Pull to Local (Shift+Left)",
+                                       "< Pull (Shift+Left)",
                                        self.pull_file,
                                        style='action')
         btn_pull.pack(side=tk.LEFT, padx=10)
+        
+        # Removed central delete button
         
         sep = tk.Label(btn_container, text="<>",
                       font=self.fonts['title'],
@@ -302,13 +337,13 @@ class ADBFileManager:
         sep.pack(side=tk.LEFT, padx=20)
         
         btn_push = self._create_button(btn_container,
-                                       "Push to Android (Shift+Right) >",
+                                       "Push > (Shift+Right)",
                                        self.push_file,
                                        style='action')
         btn_push.pack(side=tk.LEFT, padx=10)
         
         tip_label = tk.Label(frame, 
-                            text="Tip: Use arrow keys to navigate, Shift+Arrow to transfer",
+                            text="Tip: Use arrow keys to navigate, Shift+Arrow to transfer, Delete key to remove",
                             font=self.fonts['small'],
                             fg='#808080',
                             bg=self.colors['bg_light'])
@@ -326,9 +361,11 @@ class ADBFileManager:
     def set_loading(self, is_loading):
         if is_loading:
             self._animate_progress()
+            self.lbl_percent.config(text="...")
         else:
             self.progress_canvas.itemconfig(self.progress_bar_rect, fill=self.colors['accent'])
             self.progress_canvas.coords(self.progress_bar_rect, 0, 0, 0, 20)
+            self.lbl_percent.config(text="0%")
 
     def _animate_progress(self):
         if not hasattr(self, '_progress_pos'):
@@ -345,6 +382,7 @@ class ADBFileManager:
         width = int((value / 100) * 250)
         self.progress_canvas.coords(self.progress_bar_rect, 0, 0, width, 20)
         self.progress_canvas.itemconfig(self.progress_bar_rect, fill=self.colors['success'])
+        self.lbl_percent.config(text=f"{int(value)}%")
 
     def update_status_indicator(self, color):
         self.status_indicator.itemconfig(self.status_circle, fill=color)
@@ -531,6 +569,52 @@ class ADBFileManager:
             if self.android_cwd == "/": self.android_cwd += name + "/"
             else: self.android_cwd = os.path.join(self.android_cwd, name) + "/"
             self.refresh_android()
+
+    # --- ACTION HANDLERS ---
+    def delete_selection(self, target=None, event=None):
+        """ Handles Deletion for both Local and Android based on context or explicit target """
+        
+        # If target not explicitly passed (e.g. keyboard shortcut), use active pane
+        if target is None:
+            target = self.active_pane
+        
+        if target == "local":
+            sel = self.tree_local.selection()
+            if not sel: return
+            item = self.tree_local.item(sel[0])
+            name = str(item['values'][0])
+            path = os.path.join(self.local_cwd, name)
+            
+            if messagebox.askyesno("Delete Local", f"Permanently delete '{name}' from PC?"):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                    self.update_status(f"Deleted: {name}", self.colors['success'])
+                    self.refresh_local()
+                except Exception as e:
+                    messagebox.showerror("Error", str(e))
+        
+        elif target == "android":
+            sel = self.tree_android.selection()
+            if not sel: return
+            item = self.tree_android.item(sel[0])
+            name = str(item['values'][0])
+            path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+            
+            # Escape spaces for ADB
+            escaped_path = f'"{path}"'
+            
+            if messagebox.askyesno("Delete Android", f"Permanently delete '{name}' from Device?"):
+                def task():
+                    out, err = self.run_adb_cmd(['shell', 'rm', '-rf', escaped_path])
+                    if err:
+                        self.root.after(0, lambda: messagebox.showerror("ADB Error", err))
+                    else:
+                        self.root.after(0, lambda: self.update_status(f"Deleted: {name}", self.colors['success']))
+                        self.root.after(0, self.refresh_android)
+                threading.Thread(target=task, daemon=True).start()
 
     def request_push_confirm(self, event=None):
         sel = self.tree_local.selection()
