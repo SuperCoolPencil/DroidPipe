@@ -46,7 +46,12 @@ class ADBFileManager:
         self.local_cwd = os.path.expanduser("~")
         self.android_cwd = "/storage/emulated/0/"
         self.connected_device = None
-        self.active_pane = "local" # Tracks which pane was last active for keyboard shortcuts
+        self.active_pane = "local" # Tracks which pane was last active
+        
+        # Search State
+        self.search_buffer = ""
+        self.search_last_time = 0
+        self.search_timeout = 1.0 # Seconds to reset buffer
 
         # --- LINUX FONT FIX ---
         base_family = "Liberation Sans" 
@@ -160,7 +165,7 @@ class ADBFileManager:
         btn_frame = tk.Frame(frame, bg=self.colors['bg_light'])
         btn_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
         
-        # --- NAV BUTTONS (Included Delete Here) ---
+        # --- NAV BUTTONS ---
         nav_buttons = [
             ("Home", lambda: self.go_home_local() if pane_type == "local" else self.go_home_android()),
             ("Up", lambda: self.go_up_local() if pane_type == "local" else self.go_up_android()),
@@ -169,7 +174,6 @@ class ADBFileManager:
         ]
         
         for text, cmd in nav_buttons:
-            # Use danger_small style for the delete button
             style = 'danger_small' if text == "Delete" else 'small'
             btn = self._create_button(btn_frame, text, cmd, style=style)
             btn.pack(side=tk.LEFT, padx=2)
@@ -179,6 +183,9 @@ class ADBFileManager:
         
         tree = self._create_treeview(tree_frame)
         
+        # Bindings
+        search_callback = lambda e, t=tree: self.on_key_search(e, t)
+        
         if pane_type == "local":
             self.tree_local = tree
             tree.bind("<Double-1>", self.on_local_interact)
@@ -187,7 +194,8 @@ class ADBFileManager:
             tree.bind("<Right>", lambda e: self.tree_android.focus_set())
             tree.bind("<Shift-Right>", self.request_push_confirm)
             tree.bind("<FocusIn>", lambda e: setattr(self, 'active_pane', 'local'))
-            tree.bind("<Delete>", lambda e: self.delete_selection(target='local')) 
+            tree.bind("<Delete>", lambda e: self.delete_selection(target='local'))
+            tree.bind("<Key>", search_callback) 
         else:
             self.tree_android = tree
             tree.bind("<Double-1>", self.on_android_interact)
@@ -197,6 +205,7 @@ class ADBFileManager:
             tree.bind("<Shift-Left>", self.request_pull_confirm)
             tree.bind("<FocusIn>", lambda e: setattr(self, 'active_pane', 'android'))
             tree.bind("<Delete>", lambda e: self.delete_selection(target='android'))
+            tree.bind("<Key>", search_callback)
         
         return frame
 
@@ -204,10 +213,11 @@ class ADBFileManager:
         tree_frame = tk.Frame(parent, bg=self.colors['bg_dark'])
         tree_frame.pack(fill=tk.BOTH, expand=True)
         
+        # Changed selectmode to extended for multiple selection
         tree = ttk.Treeview(tree_frame, 
                            columns=('Name', 'Size', 'Type'),
                            show='headings',
-                           selectmode='browse',
+                           selectmode='extended',
                            height=15)
         
         style = ttk.Style()
@@ -235,9 +245,9 @@ class ADBFileManager:
         style.map("Treeview.Heading",
                  background=[('active', self.colors['bg_light'])])
         
-        tree.heading('Name', text='Name')
-        tree.heading('Size', text='Size')
-        tree.heading('Type', text='Type')
+        # Add sorting commands
+        for col in ['Name', 'Size', 'Type']:
+            tree.heading(col, text=col, command=lambda c=col: self.sort_column(tree, c, False))
         
         tree.column('Name', width=300, minwidth=150)
         tree.column('Size', width=100, minwidth=80, anchor='e')
@@ -264,7 +274,6 @@ class ADBFileManager:
             font_obj = self.fonts['bold']
             padx, pady = 15, 10
         elif style == 'danger_small':
-            # Subtle danger button for nav bar
             bg = self.colors['bg']
             fg = self.colors['error']
             active_bg = self.colors['bg_light']
@@ -293,7 +302,6 @@ class ADBFileManager:
                        padx=padx, pady=pady,
                        cursor='hand2')
         
-        # Override hover for danger_small to keep text red
         if style == 'danger_small':
             btn.bind('<Enter>', lambda e: btn.config(bg=active_bg, fg=self.colors['error_hover']))
             btn.bind('<Leave>', lambda e: btn.config(bg=bg, fg=self.colors['error']))
@@ -328,8 +336,6 @@ class ADBFileManager:
                                        style='action')
         btn_pull.pack(side=tk.LEFT, padx=10)
         
-        # Removed central delete button
-        
         sep = tk.Label(btn_container, text="<>",
                       font=self.fonts['title'],
                       fg=self.colors['accent'],
@@ -343,13 +349,13 @@ class ADBFileManager:
         btn_push.pack(side=tk.LEFT, padx=10)
         
         tip_label = tk.Label(frame, 
-                            text="Tip: Use arrow keys to navigate, Shift+Arrow to transfer, Delete key to remove",
+                            text="Tip: Type to search, Click headers to sort, Shift+Click for multiple selection",
                             font=self.fonts['small'],
                             fg='#808080',
                             bg=self.colors['bg_light'])
         tip_label.pack(pady=(0, 10))
 
-    # --- UTILS & ADB ---
+    # --- UTILS & SEARCH ---
     def select_first_item(self, tree):
         children = tree.get_children()
         if children:
@@ -357,6 +363,50 @@ class ADBFileManager:
             tree.selection_set(first)
             tree.focus(first)
             tree.see(first)
+
+    def sort_column(self, tree, col, reverse):
+        l = [(tree.set(k, col), k) for k in tree.get_children('')]
+        
+        # Helper for natural sort (File vs Folder logic handled mostly by refresh, 
+        # but this does alphanumeric sort)
+        try:
+            # Try to sort by size as number if possible
+            if col == 'Size':
+                def size_val(x):
+                    s = x[0].lower().replace('kb', '').replace('mb', '').replace('gb', '').strip()
+                    if s == '?' or s == '': return -1
+                    return float(s)
+                l.sort(key=size_val, reverse=reverse)
+            else:
+                l.sort(key=lambda t: t[0].lower(), reverse=reverse)
+        except:
+            l.sort(reverse=reverse)
+
+        for index, (val, k) in enumerate(l):
+            tree.move(k, '', index)
+
+        tree.heading(col, command=lambda: self.sort_column(tree, col, not reverse))
+
+    def on_key_search(self, event, tree):
+        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Return', 'Escape', 'Delete', 'Shift_L', 'Shift_R'):
+            return
+        
+        now = time.time()
+        if now - self.search_last_time > self.search_timeout:
+            self.search_buffer = ""
+        self.search_last_time = now
+        
+        if event.char and event.char.isprintable():
+            self.search_buffer += event.char.lower()
+            
+            # Find matching item
+            for child in tree.get_children():
+                name = tree.item(child)['values'][0].lower()
+                if name.startswith(self.search_buffer):
+                    tree.selection_set(child)
+                    tree.see(child)
+                    tree.focus(child)
+                    return
 
     def set_loading(self, is_loading):
         if is_loading:
@@ -523,7 +573,8 @@ class ADBFileManager:
         def fetch():
             self._loading = True
             self.root.after(0, lambda: self.set_loading(True))
-            cmd = ['shell', f'ls -p "{self.android_cwd}"']
+            # Use -l to get details including size
+            cmd = ['shell', f'ls -l "{self.android_cwd}"']
             out, err = self.run_adb_cmd(cmd)
             self._loading = False
             self.root.after(0, lambda: self.set_loading(False))
@@ -532,9 +583,55 @@ class ADBFileManager:
                 lines = out.splitlines()
                 for line in lines:
                     line = line.strip()
-                    if not line: continue
-                    if line.endswith('/'): items_data.append((line[:-1], "", "Folder"))
-                    else: items_data.append((line, "?", "File"))
+                    if not line or line.startswith('total'): continue
+                    
+                    parts = line.split()
+                    if len(parts) < 4: continue # Skip malformed lines
+                    
+                    # Very basic parsing for 'ls -l' on Android (toybox)
+                    # drwxrwx--x 3 root sdcard_rw 4096 2023-01-01 12:00 Name
+                    perms = parts[0]
+                    is_dir = perms.startswith('d')
+                    
+                    # Finding size and name is tricky as columns vary.
+                    # Usually: perms links owner group size date time name
+                    # Let's assume size is 4th index (5th item) if typical
+                    # But safest is: First char 'd' = Folder.
+                    
+                    try:
+                        # Attempt to find name index. Usually date is like YYYY-MM-DD
+                        date_idx = -1
+                        for i, p in enumerate(parts):
+                            if '-' in p and ':' in parts[i+1]: # Finds date/time
+                                date_idx = i
+                                break
+                        
+                        if date_idx != -1:
+                            size_idx = date_idx - 1
+                            name_start = date_idx + 2
+                            raw_size = parts[size_idx]
+                            name = " ".join(parts[name_start:])
+                        else:
+                            # Fallback logic
+                            name = parts[-1]
+                            raw_size = "?"
+                    except:
+                        name = parts[-1]
+                        raw_size = "?"
+
+                    if name == "." or name == "..": continue
+
+                    if is_dir:
+                        items_data.append((name, "", "Folder"))
+                    else:
+                        try:
+                            s = int(raw_size)
+                            if s > 1024*1024: size_str = f"{s/(1024*1024):.1f} MB"
+                            elif s > 1024: size_str = f"{s/1024:.1f} KB"
+                            else: size_str = f"{s} B"
+                        except: size_str = "?"
+                        items_data.append((name, size_str, "File"))
+
             self.root.after(0, lambda: self._update_android_tree(items_data))
         self.lbl_android_path.config(text=self.android_cwd)
         threading.Thread(target=fetch, daemon=True).start()
@@ -572,100 +669,121 @@ class ADBFileManager:
 
     # --- ACTION HANDLERS ---
     def delete_selection(self, target=None, event=None):
-        """ Handles Deletion for both Local and Android based on context or explicit target """
-        
-        # If target not explicitly passed (e.g. keyboard shortcut), use active pane
         if target is None:
             target = self.active_pane
         
         if target == "local":
-            sel = self.tree_local.selection()
-            if not sel: return
-            item = self.tree_local.item(sel[0])
-            name = str(item['values'][0])
-            path = os.path.join(self.local_cwd, name)
+            sel_items = self.tree_local.selection()
+            if not sel_items: return
             
-            if messagebox.askyesno("Delete Local", f"Permanently delete '{name}' from PC?"):
+            count = len(sel_items)
+            msg = f"Permanently delete {count} items from PC?" if count > 1 else f"Permanently delete '{self.tree_local.item(sel_items[0])['values'][0]}' from PC?"
+            
+            if messagebox.askyesno("Delete Local", msg):
                 try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                    self.update_status(f"Deleted: {name}", self.colors['success'])
+                    for sel in sel_items:
+                        name = str(self.tree_local.item(sel)['values'][0])
+                        path = os.path.join(self.local_cwd, name)
+                        if os.path.isdir(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.remove(path)
+                    self.update_status(f"Deleted {count} items", self.colors['success'])
                     self.refresh_local()
                 except Exception as e:
                     messagebox.showerror("Error", str(e))
         
         elif target == "android":
-            sel = self.tree_android.selection()
-            if not sel: return
-            item = self.tree_android.item(sel[0])
-            name = str(item['values'][0])
-            path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+            sel_items = self.tree_android.selection()
+            if not sel_items: return
             
-            # Escape spaces for ADB
-            escaped_path = f'"{path}"'
+            count = len(sel_items)
+            msg = f"Permanently delete {count} items from Device?" if count > 1 else f"Permanently delete '{self.tree_android.item(sel_items[0])['values'][0]}' from Device?"
             
-            if messagebox.askyesno("Delete Android", f"Permanently delete '{name}' from Device?"):
+            if messagebox.askyesno("Delete Android", msg):
                 def task():
-                    out, err = self.run_adb_cmd(['shell', 'rm', '-rf', escaped_path])
-                    if err:
-                        self.root.after(0, lambda: messagebox.showerror("ADB Error", err))
-                    else:
-                        self.root.after(0, lambda: self.update_status(f"Deleted: {name}", self.colors['success']))
-                        self.root.after(0, self.refresh_android)
+                    for sel in sel_items:
+                        name = str(self.tree_android.item(sel)['values'][0])
+                        path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+                        escaped_path = f'"{path}"'
+                        self.run_adb_cmd(['shell', 'rm', '-rf', escaped_path])
+                    
+                    self.root.after(0, lambda: self.update_status(f"Deleted {count} items", self.colors['success']))
+                    self.root.after(0, self.refresh_android)
                 threading.Thread(target=task, daemon=True).start()
 
     def request_push_confirm(self, event=None):
-        sel = self.tree_local.selection()
-        if not sel: return
-        name = str(self.tree_local.item(sel[0])['values'][0])
-        if messagebox.askyesno("Confirm", f"Push '{name}' to Android?"):
+        sel_items = self.tree_local.selection()
+        if not sel_items: return
+        count = len(sel_items)
+        name = str(self.tree_local.item(sel_items[0])['values'][0])
+        msg = f"Push {count} items to Android?" if count > 1 else f"Push '{name}' to Android?"
+        if messagebox.askyesno("Confirm", msg):
             self.push_file()
 
     def request_pull_confirm(self, event=None):
-        sel = self.tree_android.selection()
-        if not sel: return
-        name = str(self.tree_android.item(sel[0])['values'][0])
-        if messagebox.askyesno("Confirm", f"Pull '{name}' from Android?"):
+        sel_items = self.tree_android.selection()
+        if not sel_items: return
+        count = len(sel_items)
+        name = str(self.tree_android.item(sel_items[0])['values'][0])
+        msg = f"Pull {count} items from Android?" if count > 1 else f"Pull '{name}' from Android?"
+        if messagebox.askyesno("Confirm", msg):
             self.pull_file()
 
     def pull_file(self):
-        sel = self.tree_android.selection()
-        if not sel: return
-        item = self.tree_android.item(sel[0])
-        name = str(item['values'][0])
-        android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+        sel_items = self.tree_android.selection()
+        if not sel_items: return
+        
+        total_files = len(sel_items)
+        
         def task():
             self.root.after(0, lambda: self.set_progress(0))
-            self.update_status(f"Pulling {name}...", self.colors['accent'])
-            out, ret_code = self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], lambda val: self.set_progress(val))
+            self.update_status(f"Pulling {total_files} items...", self.colors['accent'])
+            
+            for i, sel in enumerate(sel_items):
+                item = self.tree_android.item(sel)
+                name = str(item['values'][0])
+                android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+                
+                # Callback wrapper to calculate total progress
+                def progress_wrapper(val, idx=i):
+                    # Global % = (Completed Items * 100 + Current Item %) / Total Items
+                    global_p = (idx * 100 + val) / total_files
+                    self.set_progress(global_p)
+
+                self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], progress_wrapper)
+            
             self.root.after(0, lambda: self.set_loading(False))
-            if ret_code != 0:
-                self.root.after(0, lambda: messagebox.showerror("Error", out))
-                self.root.after(0, lambda: self.update_status("Failed", self.colors['error']))
-            else:
-                self.root.after(0, self.refresh_local)
-                self.root.after(0, lambda: self.update_status(f"Done: {name}", self.colors['success']))
+            self.root.after(0, self.refresh_local)
+            self.root.after(0, lambda: self.update_status(f"Finished pulling {total_files} items", self.colors['success']))
+            
         threading.Thread(target=task, daemon=True).start()
 
     def push_file(self):
-        sel = self.tree_local.selection()
-        if not sel: return
-        item = self.tree_local.item(sel[0])
-        name = str(item['values'][0])
-        local_path = os.path.join(self.local_cwd, name)
+        sel_items = self.tree_local.selection()
+        if not sel_items: return
+        
+        total_files = len(sel_items)
+
         def task():
             self.root.after(0, lambda: self.set_progress(0))
-            self.update_status(f"Pushing {name}...", self.colors['accent'])
-            out, ret_code = self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], lambda val: self.set_progress(val))
+            self.update_status(f"Pushing {total_files} items...", self.colors['accent'])
+            
+            for i, sel in enumerate(sel_items):
+                item = self.tree_local.item(sel)
+                name = str(item['values'][0])
+                local_path = os.path.join(self.local_cwd, name)
+                
+                def progress_wrapper(val, idx=i):
+                    global_p = (idx * 100 + val) / total_files
+                    self.set_progress(global_p)
+
+                self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], progress_wrapper)
+            
             self.root.after(0, lambda: self.set_loading(False))
-            if ret_code != 0:
-                self.root.after(0, lambda: messagebox.showerror("Error", out))
-                self.root.after(0, lambda: self.update_status("Failed", self.colors['error']))
-            else:
-                self.root.after(0, self.refresh_android)
-                self.root.after(0, lambda: self.update_status(f"Done: {name}", self.colors['success']))
+            self.root.after(0, self.refresh_android)
+            self.root.after(0, lambda: self.update_status(f"Finished pushing {total_files} items", self.colors['success']))
+            
         threading.Thread(target=task, daemon=True).start()
 
 if __name__ == "__main__":
