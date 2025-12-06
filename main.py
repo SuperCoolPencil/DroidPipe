@@ -17,7 +17,7 @@ except ImportError:
     pty = None
 
 class TransferProgressWidget(tk.Frame):
-    def __init__(self, parent, title, colors, fonts):
+    def __init__(self, parent, title, colors, fonts, cancel_cmd=None):
         super().__init__(parent, bg=colors['bg_light'], highlightthickness=1, highlightbackground=colors['border'])
         self.colors = colors
         self.pack(fill=tk.X, pady=2)
@@ -25,13 +25,21 @@ class TransferProgressWidget(tk.Frame):
         header = tk.Frame(self, bg=colors['bg_light'])
         header.pack(fill=tk.X, padx=5, pady=2)
         
-        tk.Label(header, text=title, font=fonts['small'], fg=colors['fg'], bg=colors['bg_light']).pack(side=tk.LEFT)
+        self.lbl_title = tk.Label(header, text=title, font=fonts['small'], fg=colors['fg'], bg=colors['bg_light'])
+        self.lbl_title.pack(side=tk.LEFT)
+        
+        if cancel_cmd:
+            btn_cancel = tk.Button(header, text="X", font=fonts['small'], 
+                                   bg=colors['bg_light'], fg=colors['error'],
+                                   activebackground=colors['error'], activeforeground='white',
+                                   relief='flat', bd=0, command=cancel_cmd, cursor='hand2')
+            btn_cancel.pack(side=tk.RIGHT, padx=5)
+        
         self.lbl_percent = tk.Label(header, text="0%", font=fonts['small'], fg=colors['accent'], bg=colors['bg_light'])
         self.lbl_percent.pack(side=tk.RIGHT)
         
-        self.canvas = tk.Canvas(self, width=250, height=6, bg=colors['bg_dark'], highlightthickness=0)
+        self.canvas = tk.Canvas(self, height=4, bg=colors['bg_dark'], highlightthickness=0)
         self.canvas.pack(fill=tk.X, padx=5, pady=(0, 5))
-        self.bar = self.canvas.create_rectangle(0, 0, 0, 6, fill=colors['accent'], outline='')
         
         self.bind('<Configure>', self._on_resize)
         self.pct = 0
@@ -39,20 +47,35 @@ class TransferProgressWidget(tk.Frame):
     def _on_resize(self, event):
         self._update_bar()
 
+    def update_title(self, new_title):
+        self.lbl_title.config(text=new_title)
+
     def update_progress(self, pct):
         self.pct = pct
         self.lbl_percent.config(text=f"{int(pct)}%")
         self._update_bar()
         
     def _update_bar(self):
+        # Draw progress bar on canvas
+        self.canvas.delete("all")
         w = self.canvas.winfo_width()
-        self.canvas.coords(self.bar, 0, 0, w * (self.pct / 100), 20)
+        h = self.canvas.winfo_height()
+        
+        # Background
+        self.canvas.create_rectangle(0, 0, w, h, fill=self.colors['bg_dark'], outline="")
+        
+        # Fill
+        fill_w = int(w * (self.pct / 100))
+        if fill_w > 0:
+            self.canvas.create_rectangle(0, 0, fill_w, h, fill=self.colors['accent'], outline="")
 
     def complete(self, success=True, msg=None):
-        color = self.colors['success'] if success else self.colors['error']
-        self.canvas.itemconfig(self.bar, fill=color)
-        text = msg if msg else ("Done" if success else "Error")
-        self.lbl_percent.config(text=text, fg=color)
+        if success:
+            self.lbl_title.config(text="Transfer Complete", fg=self.colors['fg'])
+            self.pct = 100
+            self._update_bar()
+        else:
+            self.lbl_title.config(text=f"Error: {msg}", fg="#ff5555")
 
 
 class DroidPipe:
@@ -436,6 +459,8 @@ class DroidPipe:
     def set_loading(self, is_loading):
         # Deprecated: The old usage was for main progress bar.
         # We can implement a small spinner in status or ignore.
+        # - [x] Modify progress bar to show per-file progress visually <!-- id: 2 -->
+        # - [x] Update status text to show "pushing x/y" <!-- id: 3 -->
         pass
 
     def _animate_progress(self):
@@ -453,6 +478,34 @@ class DroidPipe:
             color = self.colors['fg']
         self.lbl_status.config(text=msg, fg=color)
 
+    def _format_size(self, size_bytes):
+        if size_bytes > 1024*1024*1024: return f"{size_bytes/(1024*1024*1024):.2f} GB"
+        if size_bytes > 1024*1024: return f"{size_bytes/(1024*1024):.2f} MB"
+        if size_bytes > 1024: return f"{size_bytes/1024:.2f} KB"
+        return f"{size_bytes} B"
+
+    def _get_recursive_files(self, local_paths):
+        """Returns list of (abs_path, relative_path, size) tuples"""
+        files_to_transfer = []
+        for path in local_paths:
+            if os.path.isfile(path):
+                files_to_transfer.append((path, os.path.basename(path), os.path.getsize(path)))
+            elif os.path.isdir(path):
+                base_name = os.path.basename(path)
+                for root, dirs, files in os.walk(path):
+                    for f in files:
+                        abs_path = os.path.join(root, f)
+                        # Relative path from the parent of the selected directory
+                        # If we select /a/b, and file is /a/b/c/d.txt, we want c/d.txt relative to b?
+                        # No, if we push folder 'foo', it should end up as '.../foo' on device.
+                        # So relative path should include 'foo'.
+                        # If path is /home/user/foo, and file is /home/user/foo/bar.txt
+                        # We want the destination to be <android_cwd>/foo/bar.txt
+                        # So relative from os.path.dirname(path)
+                        rel_path = os.path.relpath(abs_path, os.path.dirname(path))
+                        files_to_transfer.append((abs_path, rel_path, os.path.getsize(abs_path)))
+        return files_to_transfer
+
     def run_adb_cmd(self, cmd_list):
         logging.debug(f"Running ADB command: {' '.join(cmd_list)}")
         try:
@@ -464,7 +517,7 @@ class DroidPipe:
             logging.error("ADB executable not found in PATH.")
             return None, "ADB executable not found in PATH."
 
-    def run_adb_transfer(self, cmd_list, progress_callback):
+    def run_adb_transfer(self, cmd_list, progress_callback, cancel_event=None):
         # Linux Support (pty)
         if pty is None: 
             out, err = self.run_adb_cmd(cmd_list)
@@ -478,6 +531,10 @@ class DroidPipe:
             os.close(slave_fd)
             output_buffer = b""
             while True:
+                if cancel_event and cancel_event.is_set():
+                    process.terminate()
+                    return "Cancelled", -2
+                
                 r, w, e = select.select([master_fd], [], [], 0.1)
                 if master_fd in r:
                     try:
@@ -778,30 +835,87 @@ class DroidPipe:
         sel_items = self.tree_local.selection()
         if not sel_items: return
         
-        total_items = len(sel_items)
-        session_title = f"Pushing {total_items} item(s)"
-        widget = TransferProgressWidget(self.sessions_frame, session_title, self.colors, self.fonts)
+        # 1. Collect all files first
+        local_paths = []
+        for sel in sel_items:
+            item = self.tree_local.item(sel)
+            name = str(item['values'][0])
+            local_paths.append(os.path.join(self.local_cwd, name))
+            
+        # Cancellation
+        cancel_event = threading.Event()
+        
+        def on_cancel():
+            cancel_event.set()
+        
+        # Setup Progress Widget
+        count = len(sel_items)
+        session_title = f"Preparing push..."
+        widget = TransferProgressWidget(self.sessions_frame, session_title, self.colors, self.fonts, cancel_cmd=on_cancel)
         widget.pack(side=tk.TOP, fill=tk.X, pady=2)
-
+        
         def task():
             try:
-                for i, sel in enumerate(sel_items):
-                    item = self.tree_local.item(sel)
-                    name = str(item['values'][0])
-                    local_path = os.path.join(self.local_cwd, name)
-                    
-                    def progress_wrapper(val, idx=i):
-                        global_p = (idx * 100 + val) / total_items
-                        widget.update_progress(global_p)
-
-                    self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], progress_wrapper)
+                files_to_transfer = self._get_recursive_files(local_paths)
+                total_bytes = sum(f[2] for f in files_to_transfer)
+                if total_bytes == 0: total_bytes = 1 # Avoid div/0
                 
-                self.root.after(0, lambda: widget.complete(True))
+                formatted_total = self._format_size(total_bytes)
+                
+                transferred_bytes = 0
+                is_cancelled = False
+                
+                for i, (abs_path, rel_path, size) in enumerate(files_to_transfer):
+                    if cancel_event.is_set():
+                        is_cancelled = True
+                        break
+
+                    # Update Title/Status initially for this file
+                    pct = (transferred_bytes / total_bytes) * 100
+                    widget.update_title(f"Pushing: {pct:.1f}%")
+                    
+                    # Update Progress Bar for current file (reset to 0 initially)
+                    widget.update_progress(0)
+                    
+                    remote_dest = self.android_cwd + rel_path if self.android_cwd.endswith('/') else self.android_cwd + '/' + rel_path
+                    remote_dir = os.path.dirname(remote_dest)
+                    
+                    def progress_wrapper(val):
+                        # val is percentage of CURRENT file
+                        widget.update_progress(val)
+                        
+                        # Update global text
+                        current_file_bytes = int(size * (val / 100.0))
+                        current_global_bytes = transferred_bytes + current_file_bytes
+                        global_pct = (current_global_bytes / total_bytes) * 100
+                        widget.update_title(f"Pushing: {global_pct:.1f}%")
+
+                    # Using escaped paths just in case
+                    cmd = ['push', '-p', abs_path, remote_dest] 
+                    res, code = self.run_adb_transfer(cmd, progress_wrapper, cancel_event)
+                    
+                    if code == -2 or cancel_event.is_set(): # Cancelled
+                        is_cancelled = True
+                        # Cleanup partial file
+                        self.run_adb_cmd(['shell', 'rm', '-f', f'"{remote_dest}"'])
+                        break
+                    
+                    if code != 0:
+                         widget.update_title(f"Error transferring {rel_path}")
+                    
+                    transferred_bytes += size
+                
+                if is_cancelled:
+                     widget.complete(False, "Cancelled")
+                else:
+                    widget.complete(True)
+                
                 self.root.after(0, self.refresh_android)
                 self.root.after(5000, widget.destroy)
+                
             except Exception as e:
                 self.root.after(0, lambda: widget.complete(False, str(e)))
-            
+
         threading.Thread(target=task, daemon=True).start()
 
 if __name__ == "__main__":
