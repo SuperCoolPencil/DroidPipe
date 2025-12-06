@@ -16,7 +16,46 @@ try:
 except ImportError:
     pty = None
 
-class ADBFileManager:
+class TransferProgressWidget(tk.Frame):
+    def __init__(self, parent, title, colors, fonts):
+        super().__init__(parent, bg=colors['bg_light'], highlightthickness=1, highlightbackground=colors['border'])
+        self.colors = colors
+        self.pack(fill=tk.X, pady=2)
+        
+        header = tk.Frame(self, bg=colors['bg_light'])
+        header.pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(header, text=title, font=fonts['small'], fg=colors['fg'], bg=colors['bg_light']).pack(side=tk.LEFT)
+        self.lbl_percent = tk.Label(header, text="0%", font=fonts['small'], fg=colors['accent'], bg=colors['bg_light'])
+        self.lbl_percent.pack(side=tk.RIGHT)
+        
+        self.canvas = tk.Canvas(self, width=250, height=6, bg=colors['bg_dark'], highlightthickness=0)
+        self.canvas.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.bar = self.canvas.create_rectangle(0, 0, 0, 6, fill=colors['accent'], outline='')
+        
+        self.bind('<Configure>', self._on_resize)
+        self.pct = 0
+
+    def _on_resize(self, event):
+        self._update_bar()
+
+    def update_progress(self, pct):
+        self.pct = pct
+        self.lbl_percent.config(text=f"{int(pct)}%")
+        self._update_bar()
+        
+    def _update_bar(self):
+        w = self.canvas.winfo_width()
+        self.canvas.coords(self.bar, 0, 0, w * (self.pct / 100), 20)
+
+    def complete(self, success=True, msg=None):
+        color = self.colors['success'] if success else self.colors['error']
+        self.canvas.itemconfig(self.bar, fill=color)
+        text = msg if msg else ("Done" if success else "Error")
+        self.lbl_percent.config(text=text, fg=color)
+
+
+class DroidPipe:
     def __init__(self, root):
         self.root = root
         self.root.title("DroidPipe - ADB File Manager")
@@ -92,24 +131,10 @@ class ADBFileManager:
                                    bg=self.colors['bg'])
         self.lbl_status.pack(side=tk.LEFT)
         
-        progress_frame = tk.Frame(top_frame, bg=self.colors['bg_dark'], 
-                                 highlightthickness=1, highlightbackground=self.colors['border'])
-        progress_frame.pack(side=tk.LEFT, padx=15)
         
-        self.progress_canvas = tk.Canvas(progress_frame, width=250, height=20, 
-                                        bg=self.colors['bg_dark'], 
-                                        highlightthickness=0)
-        self.progress_canvas.pack(side=tk.LEFT)
-        self.progress_bar_rect = self.progress_canvas.create_rectangle(0, 0, 0, 20, 
-                                                                       fill=self.colors['accent'], 
-                                                                       outline='')
-        
-        self.lbl_percent = tk.Label(progress_frame, text="0%", 
-                                    font=self.fonts['small'],
-                                    fg=self.colors['fg'],
-                                    bg=self.colors['bg_dark'],
-                                    width=5)
-        self.lbl_percent.pack(side=tk.LEFT, padx=(5, 5))
+        self.sessions_frame = tk.Frame(top_frame, bg=self.colors['bg'])
+        self.sessions_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10)
+
         
         btn_reconnect = self._create_button(top_frame, "[R] Reconnect", 
                                            self._check_connection,
@@ -409,30 +434,16 @@ class ADBFileManager:
                     return
 
     def set_loading(self, is_loading):
-        if is_loading:
-            self._animate_progress()
-            self.lbl_percent.config(text="...")
-        else:
-            self.progress_canvas.itemconfig(self.progress_bar_rect, fill=self.colors['accent'])
-            self.progress_canvas.coords(self.progress_bar_rect, 0, 0, 0, 20)
-            self.lbl_percent.config(text="0%")
+        # Deprecated: The old usage was for main progress bar.
+        # We can implement a small spinner in status or ignore.
+        pass
 
     def _animate_progress(self):
-        if not hasattr(self, '_progress_pos'):
-            self._progress_pos = 0
-        self._progress_pos = (self._progress_pos + 5) % 250
-        width = 50
-        self.progress_canvas.coords(self.progress_bar_rect, 
-                                   self._progress_pos, 0, 
-                                   self._progress_pos + width, 20)
-        if hasattr(self, '_loading') and self._loading:
-            self.root.after(20, self._animate_progress)
+        pass
 
     def set_progress(self, value):
-        width = int((value / 100) * 250)
-        self.progress_canvas.coords(self.progress_bar_rect, 0, 0, width, 20)
-        self.progress_canvas.itemconfig(self.progress_bar_rect, fill=self.colors['success'])
-        self.lbl_percent.config(text=f"{int(value)}%")
+        pass
+
 
     def update_status_indicator(self, color):
         self.status_indicator.itemconfig(self.status_circle, fill=color)
@@ -734,28 +745,32 @@ class ADBFileManager:
         sel_items = self.tree_android.selection()
         if not sel_items: return
         
-        total_files = len(sel_items)
+        total_items = len(sel_items)
+        session_title = f"Pulling {total_items} item(s)"
+        widget = TransferProgressWidget(self.sessions_frame, session_title, self.colors, self.fonts)
+        # Pack new sessions at the top or bottom of the session frame? 
+        # Side=TOP usually makes sense for a stack
+        widget.pack(side=tk.TOP, fill=tk.X, pady=2)
         
         def task():
-            self.root.after(0, lambda: self.set_progress(0))
-            self.update_status(f"Pulling {total_files} items...", self.colors['accent'])
-            
-            for i, sel in enumerate(sel_items):
-                item = self.tree_android.item(sel)
-                name = str(item['values'][0])
-                android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
-                
-                # Callback wrapper to calculate total progress
-                def progress_wrapper(val, idx=i):
-                    # Global % = (Completed Items * 100 + Current Item %) / Total Items
-                    global_p = (idx * 100 + val) / total_files
-                    self.set_progress(global_p)
+            try:
+                for i, sel in enumerate(sel_items):
+                    item = self.tree_android.item(sel)
+                    name = str(item['values'][0])
+                    android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+                    
+                    def progress_wrapper(val, idx=i):
+                        global_p = (idx * 100 + val) / total_items
+                        widget.update_progress(global_p)
 
-                self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], progress_wrapper)
-            
-            self.root.after(0, lambda: self.set_loading(False))
-            self.root.after(0, self.refresh_local)
-            self.root.after(0, lambda: self.update_status(f"Finished pulling {total_files} items", self.colors['success']))
+                    self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], progress_wrapper)
+                
+                self.root.after(0, lambda: widget.complete(True))
+                self.root.after(0, self.refresh_local)
+                # Cleanup widget after delay
+                self.root.after(5000, widget.destroy)
+            except Exception as e:
+                self.root.after(0, lambda: widget.complete(False, str(e)))
             
         threading.Thread(target=task, daemon=True).start()
 
@@ -763,26 +778,29 @@ class ADBFileManager:
         sel_items = self.tree_local.selection()
         if not sel_items: return
         
-        total_files = len(sel_items)
+        total_items = len(sel_items)
+        session_title = f"Pushing {total_items} item(s)"
+        widget = TransferProgressWidget(self.sessions_frame, session_title, self.colors, self.fonts)
+        widget.pack(side=tk.TOP, fill=tk.X, pady=2)
 
         def task():
-            self.root.after(0, lambda: self.set_progress(0))
-            self.update_status(f"Pushing {total_files} items...", self.colors['accent'])
-            
-            for i, sel in enumerate(sel_items):
-                item = self.tree_local.item(sel)
-                name = str(item['values'][0])
-                local_path = os.path.join(self.local_cwd, name)
-                
-                def progress_wrapper(val, idx=i):
-                    global_p = (idx * 100 + val) / total_files
-                    self.set_progress(global_p)
+            try:
+                for i, sel in enumerate(sel_items):
+                    item = self.tree_local.item(sel)
+                    name = str(item['values'][0])
+                    local_path = os.path.join(self.local_cwd, name)
+                    
+                    def progress_wrapper(val, idx=i):
+                        global_p = (idx * 100 + val) / total_items
+                        widget.update_progress(global_p)
 
-                self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], progress_wrapper)
-            
-            self.root.after(0, lambda: self.set_loading(False))
-            self.root.after(0, self.refresh_android)
-            self.root.after(0, lambda: self.update_status(f"Finished pushing {total_files} items", self.colors['success']))
+                    self.run_adb_transfer(['push', '-p', local_path, self.android_cwd], progress_wrapper)
+                
+                self.root.after(0, lambda: widget.complete(True))
+                self.root.after(0, self.refresh_android)
+                self.root.after(5000, widget.destroy)
+            except Exception as e:
+                self.root.after(0, lambda: widget.complete(False, str(e)))
             
         threading.Thread(target=task, daemon=True).start()
 
@@ -793,5 +811,5 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
     root = tk.Tk()
-    app = ADBFileManager(root)
+    app = DroidPipe(root)
     root.mainloop()
