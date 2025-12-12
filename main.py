@@ -35,6 +35,9 @@ class TransferProgressWidget(tk.Frame):
                                    relief='flat', bd=0, command=cancel_cmd, cursor='hand2')
             btn_cancel.pack(side=tk.RIGHT, padx=5)
         
+        self.lbl_stats = tk.Label(header, text="", font=fonts['small'], fg=colors['fg'], bg=colors['bg_light'])
+        self.lbl_stats.pack(side=tk.RIGHT, padx=10)
+        
         self.lbl_percent = tk.Label(header, text="0%", font=fonts['small'], fg=colors['accent'], bg=colors['bg_light'])
         self.lbl_percent.pack(side=tk.RIGHT)
         
@@ -46,6 +49,9 @@ class TransferProgressWidget(tk.Frame):
 
     def _on_resize(self, event):
         self._update_bar()
+
+    def update_stats(self, stats_text):
+        self.lbl_stats.config(text=stats_text)
 
     def update_title(self, new_title):
         self.lbl_title.config(text=new_title)
@@ -226,6 +232,20 @@ class DroidPipe:
             btn = self._create_button(btn_frame, text, cmd, style=style)
             btn.pack(side=tk.LEFT, padx=2)
         
+        # Disk Info Footer
+        disk_label = tk.Label(frame, text="Checking disk space...", 
+                             font=self.fonts['small'], 
+                             fg='#808080', 
+                             bg=self.colors['bg_light'],
+                             anchor='e',
+                             padx=10, pady=5)
+        disk_label.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        if pane_type == "local":
+            self.lbl_local_disk = disk_label
+        else:
+            self.lbl_android_disk = disk_label
+
         tree_frame = tk.Frame(frame, bg=self.colors['bg_light'])
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         
@@ -615,6 +635,16 @@ class DroidPipe:
                     except: size = "?"
                     self.tree_local.insert('', 'end', values=(item, size, "File"))
             self.select_first_item(self.tree_local)
+            
+            # Disk Usage
+            try:
+                total, used, free = shutil.disk_usage(self.local_cwd)
+                free_str = self._format_size(free)
+                total_str = self._format_size(total)
+                self.lbl_local_disk.config(text=f"Local: {free_str} free / {total_str} total")
+            except:
+                self.lbl_local_disk.config(text="Disk info unavailable")
+
         except PermissionError:
             self.go_up_local()
 
@@ -701,6 +731,33 @@ class DroidPipe:
                         items_data.append((name, size_str, "File"))
 
             self.root.after(0, lambda: self._update_android_tree(items_data))
+            
+            # Disk Usage (df)
+            try:
+                # Use -k for 1K blocks explicitly if supported, or just default
+                cmd_df = ['shell', f'df "{self.android_cwd}"']
+                out_df, err_df = self.run_adb_cmd(cmd_df)
+                if out_df:
+                    lines = out_df.strip().splitlines()
+                    # Filter for the line that likely contains our path or the last line
+                    # Output usually: Filesystem 1K-blocks Used Available Use% Mounted on
+                    # We pick the last line usually
+                    if len(lines) >= 2:
+                        parts = lines[-1].split()
+                        # Assuming 1K blocks standard behavior for toybox/toolbox df
+                        # parts indices: 0=fs, 1=total, 2=used, 3=avail
+                        if len(parts) >= 4:
+                            try:
+                                total = int(parts[1]) * 1024
+                                avail = int(parts[3]) * 1024
+                                t_str = self._format_size(total)
+                                a_str = self._format_size(avail)
+                                self.root.after(0, lambda: self.lbl_android_disk.config(text=f"Android: {a_str} free / {t_str} total"))
+                            except:
+                                pass
+            except Exception:
+                pass
+
         self.lbl_android_path.config(text=self.android_cwd)
         threading.Thread(target=fetch, daemon=True).start()
 
@@ -811,25 +868,78 @@ class DroidPipe:
         
         def task():
             try:
-                for i, sel in enumerate(sel_items):
+                # 1. Calculate stats with du
+                paths_to_pull = []
+                for sel in sel_items:
                     item = self.tree_android.item(sel)
                     name = str(item['values'][0])
-                    android_path = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+                    p = self.android_cwd + name if self.android_cwd.endswith('/') else self.android_cwd + '/' + name
+                    paths_to_pull.append(p)
+                
+                total_bytes = 0
+                item_sizes = []
+                try:
+                    # Get size for each item to track progress accurately
+                    for p in paths_to_pull:
+                        # du -s -k for summary in KB. 
+                        out, _ = self.run_adb_cmd(['shell', 'du', '-s', '-k', f'"{p}"'])
+                        size_b = 0
+                        if out:
+                            # Output: 1234   /path/to/file
+                            parts = out.split()
+                            if parts:
+                                try: size_b = int(parts[0]) * 1024
+                                except: pass
+                        item_sizes.append(size_b)
+                        total_bytes += size_b
+                except:
+                    # Fallback if du fails
+                    item_sizes = [0] * len(paths_to_pull)
+                    total_bytes = 1
+                
+                if total_bytes == 0: total_bytes = 1
+                
+                start_time = time.time()
+                transferred_so_far = 0
+                
+                for i, sel in enumerate(sel_items):
+                    android_path = paths_to_pull[i]
+                    current_item_size = item_sizes[i]
                     
-                    def progress_wrapper(val, idx=i):
-                        global_p = (idx * 100 + val) / total_items
+                    def progress_wrapper(val, idx=i, c_size=current_item_size):
+                        # Global percent based on item count (legacy) or bytes?
+                        # Let's use bytes for accuracy if we have them
+                        curr_file_bytes = int(c_size * (val / 100.0))
+                        curr_total = transferred_so_far + curr_file_bytes
+                        
+                        # Use raw val for per-file progress if needed, 
+                        # but widget only has one bar. 
+                        # Let's show global progress on the bar.
+                        global_p = (curr_total / total_bytes) * 100
+                        if global_p > 100: global_p = 100
                         widget.update_progress(global_p)
+                        
+                        # Stats
+                        elapsed = time.time() - start_time
+                        if elapsed > 0.5:
+                            speed = curr_total / elapsed
+                            if speed > 0:
+                                eta = (total_bytes - curr_total) / speed
+                                speed_str = self._format_size(speed) + "/s"
+                                eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+                                widget.update_stats(f"{speed_str} | ETA: {eta_str}")
 
                     self.run_adb_transfer(['pull', '-p', android_path, self.local_cwd], progress_wrapper)
+                    transferred_so_far += current_item_size
                 
                 self.root.after(0, lambda: widget.complete(True))
                 self.root.after(0, self.refresh_local)
-                # Cleanup widget after delay
                 self.root.after(5000, widget.destroy)
             except Exception as e:
                 self.root.after(0, lambda: widget.complete(False, str(e)))
             
         threading.Thread(target=task, daemon=True).start()
+
 
     def push_file(self):
         sel_items = self.tree_local.selection()
@@ -865,6 +975,8 @@ class DroidPipe:
                 transferred_bytes = 0
                 is_cancelled = False
                 
+                start_time = time.time()
+
                 for i, (abs_path, rel_path, size) in enumerate(files_to_transfer):
                     if cancel_event.is_set():
                         is_cancelled = True
@@ -875,20 +987,30 @@ class DroidPipe:
                     widget.update_title(f"Pushing: {pct:.1f}%")
                     
                     # Update Progress Bar for current file (reset to 0 initially)
-                    widget.update_progress(0)
+                    widget.update_progress(pct) # Actually let's show global progress on bar
                     
                     remote_dest = self.android_cwd + rel_path if self.android_cwd.endswith('/') else self.android_cwd + '/' + rel_path
                     remote_dir = os.path.dirname(remote_dest)
                     
                     def progress_wrapper(val):
                         # val is percentage of CURRENT file
-                        widget.update_progress(val)
                         
                         # Update global text
                         current_file_bytes = int(size * (val / 100.0))
                         current_global_bytes = transferred_bytes + current_file_bytes
                         global_pct = (current_global_bytes / total_bytes) * 100
                         widget.update_title(f"Pushing: {global_pct:.1f}%")
+                        widget.update_progress(global_pct)
+
+                        # Stats
+                        elapsed = time.time() - start_time
+                        if elapsed > 0.5:
+                            speed = current_global_bytes / elapsed
+                            if speed > 0:
+                                eta = (total_bytes - current_global_bytes) / speed
+                                speed_str = self._format_size(speed) + "/s"
+                                eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+                                widget.update_stats(f"{speed_str} | ETA: {eta_str}")
 
                     # Using escaped paths just in case
                     cmd = ['push', '-p', abs_path, remote_dest] 
